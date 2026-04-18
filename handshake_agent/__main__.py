@@ -84,7 +84,7 @@ def _parse_args() -> AgentConfig:
     p.add_argument(
         "--slow-mo",
         type=int,
-        default=50,
+        default=0,
         help="Slow down Playwright actions by this many ms (helps Handshake keep up).",
     )
     p.add_argument(

@@ -77,7 +77,7 @@ class AgentConfig:
     dry_run: bool = False
     max_jobs: int | None = None
     min_confidence_to_auto: int = 3
-    slow_mo_ms: int = 50
+    slow_mo_ms: int = 0
     email: str | None = None
     password: str | None = None
     login_timeout_s: int = 600
@@ -278,7 +278,11 @@ class HandshakeLabelAgent:
             console.rule(f"[bold]Page {page_num}[/bold] ({url})")
             await page.goto(url, wait_until="domcontentloaded")
             try:
-                await page.wait_for_load_state("networkidle", timeout=15_000)
+                await page.wait_for_selector(
+                    "a[href*='/jobs/'], a[href*='/postings/']",
+                    state="attached",
+                    timeout=8_000,
+                )
             except PWTimeoutError:
                 pass
 
@@ -345,7 +349,11 @@ class HandshakeLabelAgent:
         url = HANDSHAKE_JOB_URL.format(job_id=job_id)
         await page.goto(url, wait_until="domcontentloaded")
         try:
-            await page.wait_for_load_state("networkidle", timeout=15_000)
+            await page.wait_for_selector(
+                "text=NORMAL LABELS, text=Select a label",
+                state="visible",
+                timeout=8_000,
+            )
         except PWTimeoutError:
             pass
 
@@ -493,18 +501,13 @@ class HandshakeLabelAgent:
 
     async def _saw_already_applied_toast(self, page: Page) -> bool:
         """Handshake flashes a red 'This label has already been applied'
-        toast when you try to re-add an existing label. Poll for ~2s."""
-        for _ in range(8):
-            try:
-                if (
-                    await page.get_by_text("already been applied", exact=False).count()
-                    > 0
-                ):
-                    return True
-            except Exception:
-                pass
-            await page.wait_for_timeout(250)
-        return False
+        toast when you try to re-add an existing label. Quick check."""
+        try:
+            return (
+                await page.get_by_text("already been applied", exact=False).count() > 0
+            )
+        except Exception:
+            return False
 
     async def _scroll_label_panel_into_view(self, page: Page) -> None:
         """Scroll the 'NORMAL LABELS' panel into view so clicks work."""
@@ -565,48 +568,59 @@ class HandshakeLabelAgent:
 
         Handshake's chooser is a custom React combobox that:
           - displays the text 'Select a label…' when closed,
-          - on click, renders a visible <input placeholder="Type to search…">,
+          - on click, renders a visible <input placeholder='Type to search…'>,
           - shows a dropdown list where each option row has the label name
-            (bold) and a 'Normal Label' subtitle.
+            on line 1 and 'Normal Label' on line 2.
 
-        Handshake auto-saves; no Save button is needed. We just click the
-        option and close the dropdown.
+        Handshake auto-saves; no Save button is needed.
         """
         await self._scroll_label_panel_into_view(page)
-        await page.wait_for_timeout(300)
 
-        if not await self._open_label_chooser(page):
+        if not await self._click_select_a_label(page):
             raise RuntimeError("Could not find the 'Select a label...' dropdown.")
 
-        search = await self._find_label_search_input(page)
-        if search is None:
+        search_handle = await page.wait_for_selector(
+            "input[placeholder='Type to search...'], "
+            "input[placeholder*='Type to search' i], "
+            "input[role='combobox'], "
+            "input[aria-autocomplete='list']",
+            state="visible",
+            timeout=4_000,
+        )
+        if search_handle is None:
             raise RuntimeError("Label chooser opened but 'Type to search...' input not found.")
 
-        await search.fill("")
-        await search.type(label, delay=15)
-        await page.wait_for_timeout(800)
+        try:
+            await search_handle.fill("")
+            await search_handle.fill(label)
+        except Exception as exc:
+            raise RuntimeError(f"Could not type into label search: {exc}") from exc
 
-        option = await self._find_label_option(page, label)
-        if option is None:
+        option_handle = await self._wait_for_label_option(page, label, timeout_ms=4_000)
+
+        if option_handle is None:
             try:
-                await search.press("Enter")
+                await search_handle.press("Enter")
             except Exception:
                 pass
-            await page.wait_for_timeout(600)
-            option = await self._find_label_option(page, label)
+            await page.wait_for_timeout(300)
+            option_handle = await self._wait_for_label_option(page, label, timeout_ms=1_500)
 
-        if option is None:
-            # Bail out cleanly: close the chooser so next job isn't affected.
+        if option_handle is None:
             try:
                 await page.keyboard.press("Escape")
             except Exception:
                 pass
-            raise RuntimeError(
-                f"Dropdown did not offer an option matching {label!r}."
-            )
+            raise RuntimeError(f"Dropdown did not offer an option matching {label!r}.")
 
-        await option.click()
-        await page.wait_for_timeout(1_000)
+        try:
+            await option_handle.click()
+        except Exception:
+            # Handle went stale – try Enter on the search input as fallback.
+            try:
+                await search_handle.press("Enter")
+            except Exception:
+                pass
 
         try:
             await page.keyboard.press("Escape")
@@ -615,102 +629,80 @@ class HandshakeLabelAgent:
 
         await self._wait_for_label_to_appear(page, label)
 
-    async def _open_label_chooser(self, page: Page) -> bool:
-        """Click the element that shows 'Select a label…' and returns True
-        if a search input appears within a few seconds."""
-        clicked = False
+    async def _click_select_a_label(self, page: Page) -> bool:
+        """Click the 'Select a label...' chooser. Returns True on success."""
         selectors = (
-            # Text-based – most reliable since the placeholder is stable.
             "text=/^\\s*Select a label/i",
-            "div:has-text('Select a label')",
             "[placeholder*='Select a label' i]",
             "[aria-label*='Select a label' i]",
-            "button:has-text('Select a label')",
-            # Structural fallbacks inside the Label panel.
+            "div:has-text('Select a label')",
             "xpath=//*[contains(text(),'NORMAL LABELS')]/following::*"
             "[self::div or self::button or self::span][1]",
         )
         for sel in selectors:
             try:
-                loc = page.locator(sel).first
-                if not await loc.count():
-                    continue
-                await loc.scroll_into_view_if_needed(timeout=1_500)
-                await loc.click(timeout=2_500)
-                clicked = True
-                break
+                handle = await page.wait_for_selector(sel, state="visible", timeout=1_500)
             except Exception:
+                handle = None
+            if handle is None:
                 continue
-
-        if not clicked:
-            return False
-
-        # Wait briefly for the search input to appear.
-        for _ in range(10):
-            inp = await self._find_label_search_input(page)
-            if inp is not None:
+            try:
+                await handle.scroll_into_view_if_needed(timeout=1_000)
+            except Exception:
+                pass
+            try:
+                await handle.click(timeout=1_500)
                 return True
-            await page.wait_for_timeout(250)
+            except Exception:
+                try:
+                    await handle.evaluate("el => el.click()")
+                    return True
+                except Exception:
+                    continue
         return False
 
-    async def _find_label_search_input(self, page: Page):
-        """Return a locator for the visible 'Type to search…' input,
-        or None."""
-        selectors = (
-            "input[placeholder='Type to search...']:visible",
-            "input[placeholder*='Type to search' i]:visible",
-            "input[placeholder*='Select a label' i]:visible",
-            "input[role='combobox']:visible",
-            "input[aria-autocomplete='list']:visible",
-        )
-        for sel in selectors:
-            loc = page.locator(sel).first
-            try:
-                if await loc.count() and await loc.is_visible(timeout=500):
-                    return loc
-            except Exception:
-                continue
-        return None
+    async def _wait_for_label_option(self, page: Page, label: str, timeout_ms: int):
+        """Poll up to `timeout_ms` for a dropdown option matching `label`.
 
-    async def _find_label_option(self, page: Page, label: str):
-        """Find the dropdown option whose primary text equals `label`.
-
-        Each option row in the screenshots has the label text on the
-        first line and 'Normal Label' on the second line, so we prefer
-        an element containing BOTH.
+        Returns an ElementHandle (stable, non-stale) or None.
         """
         esc = label.replace('"', '\\"')
-        selectors = (
+        selectors = [
             f"li:has-text(\"{esc}\"):has-text(\"Normal Label\")",
             f"[role='option']:has-text(\"{esc}\"):has-text(\"Normal Label\")",
             f"div:has-text(\"{esc}\"):has-text(\"Normal Label\")",
-            f"li:has-text(\"{esc}\")",
-            f"[role='option']:has-text(\"{esc}\")",
             f"li[role='option']:has-text(\"{esc}\")",
-            f"div[role='option']:has-text(\"{esc}\")",
-        )
-        for sel in selectors:
-            loc = page.locator(sel).first
-            try:
-                if await loc.count() and await loc.is_visible(timeout=500):
-                    return loc
-            except Exception:
-                continue
+            f"[role='option']:has-text(\"{esc}\")",
+            f"li:has-text(\"{esc}\")",
+        ]
+        deadline_iters = max(1, timeout_ms // 200)
+        for _ in range(deadline_iters):
+            for sel in selectors:
+                try:
+                    handle = await page.query_selector(sel)
+                except Exception:
+                    handle = None
+                if handle is None:
+                    continue
+                try:
+                    if await handle.is_visible():
+                        return handle
+                except Exception:
+                    continue
+            await page.wait_for_timeout(200)
         return None
 
     async def _wait_for_label_to_appear(self, page: Page, label: str) -> None:
-        """The PDF warns that labels take a moment to show up and the page
-        refreshes. Poll for up to ~15s until we see the label."""
+        """The PDF warns that labels take a moment to show up. Poll briefly
+        but don't block the whole run on confirmation."""
         target = label.lower().strip()
-        for _ in range(30):
-            current = [c.lower().strip() for c in await self._read_existing_labels(page)]
-            if target in current:
-                return
+        for _ in range(6):
             try:
-                await page.wait_for_load_state("networkidle", timeout=1_000)
-            except PWTimeoutError:
+                if await page.get_by_text(label, exact=True).count() > 0:
+                    return
+            except Exception:
                 pass
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(300)
 
     # ------------------------------------------------------------------
 
