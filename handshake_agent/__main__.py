@@ -34,9 +34,37 @@ def _parse_args() -> AgentConfig:
         help="Ask for confirmation before every label is applied.",
     )
     p.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help=(
+            "Fully automatic: never prompt. Apply the top-scoring label for "
+            "every job, including low-confidence ones. Overrides the "
+            "--min-confidence threshold."
+        ),
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Analyse jobs and print proposed labels but do NOT change anything.",
+    )
+    p.add_argument(
+        "--per-page",
+        type=int,
+        default=25,
+        help="Jobs per page (Handshake max 100).",
+    )
+    p.add_argument(
+        "--start-page",
+        type=int,
+        default=1,
+        help="Start from this page number in the jobs listing.",
+    )
+    p.add_argument(
+        "--max-pages",
+        type=int,
+        default=200,
+        help="Safety cap on pagination (default 200 pages).",
     )
     p.add_argument(
         "--max-jobs",
@@ -71,11 +99,15 @@ def _parse_args() -> AgentConfig:
         user_data_dir=args.user_data_dir,
         headless=args.headless,
         confirm=args.confirm,
+        yes=args.yes,
         dry_run=args.dry_run,
         max_jobs=args.max_jobs,
         min_confidence_to_auto=args.min_confidence,
         slow_mo_ms=args.slow_mo,
         login_timeout_s=args.login_timeout,
+        per_page=args.per_page,
+        start_page=args.start_page,
+        max_pages=args.max_pages,
     )
 
 

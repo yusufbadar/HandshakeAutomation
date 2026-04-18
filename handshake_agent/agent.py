@@ -52,9 +52,15 @@ from .labels import ALL_LABELS
 console = Console()
 
 
-HANDSHAKE_JOBS_URL = (
-    "https://app.joinhandshake.com/edu/postings/pending?page=1&per_page=25"
-)
+HANDSHAKE_JOBS_BASE = "https://app.joinhandshake.com/edu/postings/pending"
+HANDSHAKE_JOB_URL = "https://app.joinhandshake.com/jobs/{job_id}"
+
+
+def jobs_list_url(page_num: int, per_page: int = 25) -> str:
+    return f"{HANDSHAKE_JOBS_BASE}?page={page_num}&per_page={per_page}"
+
+
+HANDSHAKE_JOBS_URL = jobs_list_url(1)
 
 JOBS_PAGE_URL_RE = re.compile(
     r"joinhandshake\.com/(?:edu/)?postings(?:/[a-z_]+)?(?:\?|$|/)",
@@ -67,6 +73,7 @@ class AgentConfig:
     user_data_dir: str = "./.handshake-profile"
     headless: bool = False
     confirm: bool = False
+    yes: bool = False
     dry_run: bool = False
     max_jobs: int | None = None
     min_confidence_to_auto: int = 3
@@ -74,6 +81,9 @@ class AgentConfig:
     email: str | None = None
     password: str | None = None
     login_timeout_s: int = 600
+    per_page: int = 25
+    start_page: int = 1
+    max_pages: int = 200
 
 
 @dataclass
@@ -257,76 +267,87 @@ class HandshakeLabelAgent:
             pass
 
     async def _process_jobs(self, page: Page) -> None:
-        while True:
+        page_num = self.config.start_page
+        empty_streak = 0
+        while page_num < self.config.start_page + self.config.max_pages:
             if self.config.max_jobs and self.stats.labeled >= self.config.max_jobs:
                 console.print("[cyan]Reached max-jobs limit.[/cyan]")
                 return
 
-            row = await self._find_next_unvisited_job_row(page)
-            if row is None:
-                console.print("[cyan]No more unvisited jobs on this page.[/cyan]")
-                if not await self._go_to_next_page(page):
-                    return
-                continue
-
-            job_id = await self._job_row_id(row)
-            if not job_id:
-                await row.click()
-            else:
-                self.stats.visited_ids.add(job_id)
-
+            url = jobs_list_url(page_num, self.config.per_page)
+            console.rule(f"[bold]Page {page_num}[/bold] ({url})")
+            await page.goto(url, wait_until="domcontentloaded")
             try:
-                await row.click()
                 await page.wait_for_load_state("networkidle", timeout=15_000)
             except PWTimeoutError:
                 pass
 
-            await self._handle_current_job(page, job_id or "")
+            job_ids = await self._collect_job_ids(page)
+            fresh_ids = [j for j in job_ids if j not in self.stats.visited_ids]
+            console.print(
+                f"[dim]Page {page_num}: {len(job_ids)} jobs on page, "
+                f"{len(fresh_ids)} not yet visited.[/dim]"
+            )
 
-    async def _find_next_unvisited_job_row(self, page: Page):
+            if not job_ids:
+                empty_streak += 1
+                if empty_streak >= 2:
+                    console.print("[cyan]Two consecutive empty pages – stopping.[/cyan]")
+                    return
+                page_num += 1
+                continue
+            empty_streak = 0
+
+            for jid in fresh_ids:
+                if self.config.max_jobs and self.stats.labeled >= self.config.max_jobs:
+                    console.print("[cyan]Reached max-jobs limit.[/cyan]")
+                    return
+                self.stats.visited_ids.add(jid)
+                await self._open_job(page, jid)
+                await self._handle_current_job(page, jid)
+
+            page_num += 1
+
+    async def _collect_job_ids(self, page: Page) -> list[str]:
+        """Return the list of unique job IDs from the current postings page,
+        preserving row order."""
         try:
             await page.wait_for_selector(
-                "a[href*='/jobs/'], a[href*='/postings/'], tr[data-hook='postings-table-row']",
+                "a[href*='/jobs/'], a[href*='/postings/']",
                 timeout=10_000,
             )
         except PWTimeoutError:
-            return None
+            return []
 
-        rows = await page.locator(
-            "a[href*='/jobs/'], a[href*='/postings/']"
-        ).element_handles()
-        for r in rows:
-            href = await r.get_attribute("href") or ""
-            m = re.search(r"/(?:jobs|postings)/(\d+)", href)
+        hrefs: list[str] = []
+        try:
+            hrefs = await page.eval_on_selector_all(
+                "a[href*='/jobs/'], a[href*='/postings/']",
+                "els => els.map(e => e.getAttribute('href') || '')",
+            )
+        except Exception:
+            hrefs = []
+
+        ids: list[str] = []
+        seen: set[str] = set()
+        for h in hrefs:
+            m = re.search(r"/(?:jobs|postings)/(\d+)", h or "")
             if not m:
                 continue
             jid = m.group(1)
-            if jid in self.stats.visited_ids:
+            if jid in seen:
                 continue
-            return r
-        return None
+            seen.add(jid)
+            ids.append(jid)
+        return ids
 
-    async def _job_row_id(self, row) -> str | None:
-        href = await row.get_attribute("href") or ""
-        m = re.search(r"/(?:jobs|postings)/(\d+)", href)
-        return m.group(1) if m else None
-
-    async def _go_to_next_page(self, page: Page) -> bool:
-        for sel in (
-            "a[aria-label='Next page']",
-            "button[aria-label='Next page']",
-            "a:has-text('Next')",
-            "button:has-text('Next')",
-        ):
-            loc = page.locator(sel).first
-            try:
-                if await loc.is_visible():
-                    await loc.click()
-                    await page.wait_for_load_state("networkidle", timeout=15_000)
-                    return True
-            except Exception:
-                continue
-        return False
+    async def _open_job(self, page: Page, job_id: str) -> None:
+        url = HANDSHAKE_JOB_URL.format(job_id=job_id)
+        await page.goto(url, wait_until="domcontentloaded")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15_000)
+        except PWTimeoutError:
+            pass
 
     async def _handle_current_job(self, page: Page, job_id: str) -> None:
         self.stats.scanned += 1
@@ -339,7 +360,6 @@ class HandshakeLabelAgent:
         except Exception as exc:
             console.print(f"[red]Error reading job {job_id}: {exc}[/red]")
             self.stats.errors += 1
-            await self._back_to_list(page)
             return
 
         pathway_labels_on_job = [lbl for lbl in existing_labels if lbl in ALL_LABELS]
@@ -354,7 +374,6 @@ class HandshakeLabelAgent:
                 f"[yellow]Already has pathway label ({pathway_labels_on_job[0]}). Skipping.[/yellow]"
             )
             self.stats.skipped_already_labeled += 1
-            await self._back_to_list(page)
             return
 
         result = classify(title=title, description=description, majors=majors)
@@ -368,20 +387,23 @@ class HandshakeLabelAgent:
 
         if self.config.dry_run:
             console.print("[magenta]DRY RUN – not applying label.[/magenta]")
-            await self._back_to_list(page)
             return
 
-        if self.config.confirm or not result.confident or result.score < self.config.min_confidence_to_auto:
+        auto_mode = self.config.yes and not self.config.confirm
+        needs_prompt = (
+            self.config.confirm
+            or (not auto_mode and (not result.confident or result.score < self.config.min_confidence_to_auto))
+        )
+
+        if needs_prompt:
             console.print(
-                "[yellow]Low-confidence or --confirm mode.[/yellow] "
-                "[y]=apply, [s]=skip, [1..4]=override, [q]=quit"
+                "[yellow][y]=apply, [s]=skip, [1..4]=override, [q]=quit[/yellow]"
             )
             choice = (await asyncio.to_thread(input, "> ")).strip().lower()
             if choice == "q":
                 raise KeyboardInterrupt()
             if choice == "s" or choice == "n":
                 self.stats.skipped_low_confidence += 1
-                await self._back_to_list(page)
                 return
             if choice in {"1", "2", "3", "4"}:
                 result = Classification(
@@ -399,18 +421,6 @@ class HandshakeLabelAgent:
         except Exception as exc:
             console.print(f"[red]Failed to apply label: {exc}[/red]")
             self.stats.errors += 1
-
-        await self._back_to_list(page)
-
-    async def _back_to_list(self, page: Page) -> None:
-        try:
-            await page.go_back(wait_until="domcontentloaded", timeout=15_000)
-        except PWTimeoutError:
-            await page.goto(HANDSHAKE_JOBS_URL, wait_until="domcontentloaded")
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10_000)
-        except PWTimeoutError:
-            pass
 
     async def _read_title(self, page: Page) -> str:
         try:
