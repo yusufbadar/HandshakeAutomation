@@ -53,7 +53,12 @@ console = Console()
 
 
 HANDSHAKE_JOBS_URL = (
-    "https://app.joinhandshake.com/postings?sort_direction=desc&sort_column=created_at"
+    "https://app.joinhandshake.com/edu/postings/pending?page=1&per_page=25"
+)
+
+JOBS_PAGE_URL_RE = re.compile(
+    r"joinhandshake\.com/(?:edu/)?postings(?:/[a-z_]+)?(?:\?|$|/)",
+    re.IGNORECASE,
 )
 
 
@@ -135,19 +140,29 @@ class HandshakeLabelAgent:
             " finish it in the Chromium window. Waiting up to"
             f" {self.config.login_timeout_s} seconds...[/yellow]"
         )
-        try:
-            await page.wait_for_url(
-                re.compile(r"app\.joinhandshake\.com/postings"),
-                timeout=self.config.login_timeout_s * 1_000,
-            )
-        except PWTimeoutError as exc:
+        deadline = self.config.login_timeout_s
+        waited = 0
+        while waited < deadline:
+            await page.wait_for_timeout(1_500)
+            waited += 2
+            if self._on_jobs_page(page):
+                break
+        else:
             raise RuntimeError(
                 "Timed out waiting for Handshake login. Current URL: " + page.url
-            ) from exc
+            )
         console.print("[green]Logged in to Handshake.[/green]")
+        if "/edu/postings" not in page.url:
+            try:
+                await page.goto(HANDSHAKE_JOBS_URL, wait_until="domcontentloaded")
+            except Exception:
+                pass
 
     def _on_jobs_page(self, page: Page) -> bool:
-        return "joinhandshake.com/postings" in page.url and "login" not in page.url
+        url = page.url
+        if "login" in url:
+            return False
+        return bool(JOBS_PAGE_URL_RE.search(url))
 
     async def _attempt_autologin(self, page: Page, email: str, password: str) -> None:
         """Best-effort: fill Handshake's employer / career-services login form.

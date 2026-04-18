@@ -125,7 +125,25 @@ Run the (offline) classifier sanity tests:
 python3 -m tests.test_classifier
 ```
 
-## 5. Notes / known quirks
+## 5. Troubleshooting
+
+**"Still not on the jobs page. Waiting up to N seconds..."** – the agent
+didn't recognize your current URL as a jobs page. Make sure you are on one
+of these pages (Career Services staff view):
+
+- `app.joinhandshake.com/edu/postings/pending`
+- `app.joinhandshake.com/edu/postings/in_progress`
+- `app.joinhandshake.com/postings`
+
+If you're on an institutional homepage (e.g. `/stu/home`) the agent can't
+reach the jobs list automatically – navigate to **Jobs → Job postings** in
+the left sidebar yourself, then the agent will pick up.
+
+**Cloudflare "Just a moment..." screen** – this is the automated-browser
+check. Solve it once in the window; Playwright's persistent profile will
+keep the cookie. If it reappears constantly, try `--slow-mo 150`.
+
+## 6. Notes / known quirks
 
 - The four label strings in `handshake_agent/labels.py` must exactly match
   the labels in Handshake. If NYUAD renames a label, update it there.
