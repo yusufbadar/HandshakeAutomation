@@ -519,98 +519,70 @@ class HandshakeLabelAgent:
             pass
 
     async def _read_existing_labels(self, page: Page) -> list[str]:
-        """Read the blue pill chips from the 'NORMAL LABELS' section.
+        """Return the list of pathway labels already applied to this job.
 
-        The pill is a small element with the label text followed by an
-        'x' close button. We scan candidate elements in the label panel
-        and match anything that looks like a short labelled chip.
+        react-select v1 renders picked values as
+            <div class="Select-value"><span class="Select-value-label">...</span></div>
+        We scan the job page for any of the four known pathway labels
+        appearing in one of those spans (or anywhere visible), which is
+        both reliable and immune to the 'NORMAL LABELS' header text
+        accidentally matching itself.
         """
         await self._scroll_label_panel_into_view(page)
 
-        labels: list[str] = []
-        known_lower = {lbl.lower() for lbl in ALL_LABELS}
-
-        # Try: find every visible element whose inner text matches a known
-        # pathway label verbatim. This is the most reliable signal.
+        found: list[str] = []
         for lbl in ALL_LABELS:
             try:
-                loc = page.get_by_text(lbl, exact=True)
-                if await loc.count() > 0 and await loc.first.is_visible(timeout=500):
-                    labels.append(lbl)
+                count = await page.locator(
+                    f".Select-value-label:has-text(\"{lbl}\"), "
+                    f".Select-value:has-text(\"{lbl}\")"
+                ).count()
+                if count > 0:
+                    found.append(lbl)
+                    continue
+                # Generic visible-text fallback.
+                gen = page.get_by_text(lbl, exact=True)
+                if await gen.count() > 0 and await gen.first.is_visible(timeout=300):
+                    found.append(lbl)
             except Exception:
                 continue
-
-        if labels:
-            return [l.lower() for l in labels]
-
-        # Fallback: scrape any short text blob inside elements near the
-        # NORMAL LABELS header.
-        try:
-            candidates = await page.locator(
-                "xpath=//*[contains(translate(text(),'NORMAL LABELS','normal labels'),"
-                "'normal labels')]/following::*[position()<30]"
-            ).all_inner_texts()
-        except Exception:
-            candidates = []
-
-        for t in candidates:
-            t = (t or "").strip()
-            t = re.sub(r"[\u00d7xX×]\s*$", "", t).strip()
-            if not t or len(t) > 120:
-                continue
-            if t.lower() in known_lower and t not in labels:
-                labels.append(t)
-
-        return [l.lower() for l in labels]
-
-    def _label_panel(self, page: Page):
-        """Locate the Label panel on the job detail page.
-
-        The panel is uniquely identified by containing the 'Create New
-        Label' button, so we anchor everything else inside it.
-        """
-        return page.locator(
-            "xpath=//button[normalize-space()='Create New Label']"
-            "/ancestor::*[self::div or self::section][1]"
-        ).first
+        return [l.lower() for l in found]
 
     async def _apply_label(self, page: Page, label: str) -> None:
-        """Open the 'Select a label…' chooser, type the label, click the option.
+        """Drive the react-select v1 label autosuggest widget.
 
-        Handshake's chooser is a custom React combobox in the Label panel
-        (bottom-left of the job page, above the 'Create New Label' button):
-          - closed state shows 'Select a label…',
-          - on click, a visible <input placeholder='Type to search…'>
-            appears,
-          - option rows show the label name on line 1 and 'Normal Label'
-            on line 2.
+        The relevant DOM on the job page is:
 
-        Handshake auto-saves; no Save button is needed.
+            <div class="Select-control">
+              <div class="Select-multi-value-wrapper">
+                <div class="Select-placeholder">Select a label...</div>
+                <div class="Select-input label-autosuggest">
+                  <input id="label-autosuggest" class="label-autosuggest"
+                         placeholder="Select a label..." role="combobox">
+                </div>
+              </div>
+              <span class="Select-arrow-zone">...</span>
+            </div>
+
+        So we just find the input, click/focus it, type the label, wait
+        for the react-select option list to appear, and click the match.
+        Handshake auto-saves — no button to press.
         """
-        panel = self._label_panel(page)
-        try:
-            await panel.wait_for(state="visible", timeout=5_000)
-        except PWTimeoutError as exc:
-            raise RuntimeError(
-                "Could not locate the Label panel on the job page."
-            ) from exc
-        try:
-            await panel.scroll_into_view_if_needed(timeout=1_500)
-        except Exception:
-            pass
-
-        if not await self._click_select_a_label(page, panel):
+        search = await self._find_label_autosuggest_input(page)
+        if search is None:
             raise RuntimeError("Could not find the 'Select a label...' dropdown.")
 
-        # Scope the search input STRICTLY to the label panel so we never
-        # accidentally grab the global 'Search all of Handshake…' bar.
-        search = panel.locator("input:visible").first
         try:
-            await search.wait_for(state="visible", timeout=4_000)
-        except PWTimeoutError as exc:
-            raise RuntimeError(
-                "Label chooser opened but no search input appeared in the Label panel."
-            ) from exc
+            await search.scroll_into_view_if_needed(timeout=1_500)
+        except Exception:
+            pass
+        try:
+            await search.click(timeout=2_000)
+        except Exception:
+            try:
+                await search.focus()
+            except Exception:
+                pass
 
         try:
             await search.fill("")
@@ -618,17 +590,17 @@ class HandshakeLabelAgent:
         except Exception as exc:
             raise RuntimeError(f"Could not type into label search: {exc}") from exc
 
-        option_handle = await self._wait_for_label_option(page, label, timeout_ms=4_000)
+        option = await self._wait_for_label_option(page, label, timeout_ms=4_000)
 
-        if option_handle is None:
+        if option is None:
             try:
                 await search.press("Enter")
             except Exception:
                 pass
             await page.wait_for_timeout(300)
-            option_handle = await self._wait_for_label_option(page, label, timeout_ms=1_500)
+            option = await self._wait_for_label_option(page, label, timeout_ms=1_500)
 
-        if option_handle is None:
+        if option is None:
             try:
                 await page.keyboard.press("Escape")
             except Exception:
@@ -636,7 +608,7 @@ class HandshakeLabelAgent:
             raise RuntimeError(f"Dropdown did not offer an option matching {label!r}.")
 
         try:
-            await option_handle.click()
+            await option.click()
         except Exception:
             try:
                 await search.press("Enter")
@@ -650,53 +622,46 @@ class HandshakeLabelAgent:
 
         await self._wait_for_label_to_appear(page, label)
 
-    async def _click_select_a_label(self, page: Page, panel) -> bool:
-        """Click the 'Select a label...' chooser inside the Label panel."""
-        candidates = (
-            panel.locator("xpath=.//*[normalize-space()='Select a label...']").first,
-            panel.locator("xpath=.//*[contains(normalize-space(),'Select a label')]").first,
-            panel.get_by_text("Select a label", exact=False).first,
+    async def _find_label_autosuggest_input(self, page: Page):
+        """Return an ElementHandle for the react-select label input, or None."""
+        selectors = (
+            "input#label-autosuggest",
+            "input.label-autosuggest",
+            "input[name='label-autosuggest']",
+            "input[placeholder='Select a label...']",
+            ".Select-control input[role='combobox']",
+            ".Select-input input",
         )
-        for cand in candidates:
+        for sel in selectors:
             try:
-                if not await cand.count():
-                    continue
-                await cand.scroll_into_view_if_needed(timeout=1_000)
-            except Exception:
-                pass
-            try:
-                await cand.click(timeout=1_500)
-            except Exception:
-                try:
-                    handle = await cand.element_handle()
-                    if handle is not None:
-                        await handle.evaluate("el => el.click()")
-                    else:
-                        continue
-                except Exception:
-                    continue
-            # Wait briefly for a visible input to appear in the panel.
-            try:
-                await panel.locator("input:visible").first.wait_for(
-                    state="visible", timeout=1_500
+                handle = await page.wait_for_selector(
+                    sel, state="attached", timeout=2_500
                 )
-                return True
-            except PWTimeoutError:
-                continue
-        return False
+            except Exception:
+                handle = None
+            if handle is not None:
+                return handle
+        return None
 
     async def _wait_for_label_option(self, page: Page, label: str, timeout_ms: int):
-        """Poll up to `timeout_ms` for a dropdown option matching `label`.
+        """Poll up to `timeout_ms` for a react-select option matching `label`.
 
-        Returns an ElementHandle (stable, non-stale) or None.
+        react-select v1 renders options as
+          <div class="Select-option ..."> <span>Label text</span> ... </div>
+        inside a <div class="Select-menu-outer">. The 'Normal Label'
+        subtitle from the screenshot helps us disambiguate the pathway
+        labels from other similarly named 'career pathway' ones.
         """
         esc = label.replace('"', '\\"')
         selectors = [
-            f"li:has-text(\"{esc}\"):has-text(\"Normal Label\")",
+            f".Select-menu-outer .Select-option:has-text(\"{esc}\"):has-text(\"Normal Label\")",
+            f".Select-menu-outer div[role='option']:has-text(\"{esc}\"):has-text(\"Normal Label\")",
+            f".Select-menu-outer .Select-option:has-text(\"{esc}\")",
+            f".Select-menu-outer div[role='option']:has-text(\"{esc}\")",
+            f".Select-menu-outer *:has-text(\"{esc}\")",
             f"[role='option']:has-text(\"{esc}\"):has-text(\"Normal Label\")",
-            f"div:has-text(\"{esc}\"):has-text(\"Normal Label\")",
-            f"li[role='option']:has-text(\"{esc}\")",
             f"[role='option']:has-text(\"{esc}\")",
+            f"li:has-text(\"{esc}\"):has-text(\"Normal Label\")",
             f"li:has-text(\"{esc}\")",
         ]
         deadline_iters = max(1, timeout_ms // 200)
