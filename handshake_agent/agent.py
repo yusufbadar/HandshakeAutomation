@@ -25,6 +25,7 @@ visited-set of job IDs so we don't loop forever.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -36,6 +37,13 @@ from playwright.async_api import (
     async_playwright,
 )
 from rich.console import Console
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
 
 from .classifier import Classification, classify
 from .labels import ALL_LABELS
@@ -58,6 +66,9 @@ class AgentConfig:
     max_jobs: int | None = None
     min_confidence_to_auto: int = 3
     slow_mo_ms: int = 50
+    email: str | None = None
+    password: str | None = None
+    login_timeout_s: int = 600
 
 
 @dataclass
@@ -97,20 +108,138 @@ class HandshakeLabelAgent:
         console.print("[cyan]Opening Handshake jobs list...[/cyan]")
         await page.goto(HANDSHAKE_JOBS_URL, wait_until="domcontentloaded")
         try:
-            await page.wait_for_url(re.compile(r"app\.joinhandshake\.com/(postings|login)"), timeout=15_000)
+            await page.wait_for_load_state("networkidle", timeout=15_000)
         except PWTimeoutError:
             pass
 
-        if "login" in page.url or "sso" in page.url or "auth" in page.url:
-            console.print(
-                "[yellow]You are not logged in. Complete login / SSO / 2FA in the"
-                " Chromium window that opened. The agent will continue once the"
-                " jobs list is visible.[/yellow]"
-            )
+        if self._on_jobs_page(page):
+            console.print("[green]Logged in to Handshake.[/green]")
+            return
+
+        email = self.config.email or os.environ.get("HANDSHAKE_EMAIL")
+        password = self.config.password or os.environ.get("HANDSHAKE_PASSWORD")
+
+        if email and password:
+            console.print("[cyan]Attempting automatic login with credentials from env...[/cyan]")
+            try:
+                await self._attempt_autologin(page, email, password)
+            except Exception as exc:
+                console.print(f"[yellow]Auto-login attempt failed: {exc}[/yellow]")
+
+        if self._on_jobs_page(page):
+            console.print("[green]Logged in to Handshake.[/green]")
+            return
+
+        console.print(
+            "[yellow]Still not on the jobs page. If a 2FA/SSO prompt is showing,"
+            " finish it in the Chromium window. Waiting up to"
+            f" {self.config.login_timeout_s} seconds...[/yellow]"
+        )
+        try:
             await page.wait_for_url(
-                re.compile(r"app\.joinhandshake\.com/postings"), timeout=10 * 60_000
+                re.compile(r"app\.joinhandshake\.com/postings"),
+                timeout=self.config.login_timeout_s * 1_000,
             )
+        except PWTimeoutError as exc:
+            raise RuntimeError(
+                "Timed out waiting for Handshake login. Current URL: " + page.url
+            ) from exc
         console.print("[green]Logged in to Handshake.[/green]")
+
+    def _on_jobs_page(self, page: Page) -> bool:
+        return "joinhandshake.com/postings" in page.url and "login" not in page.url
+
+    async def _attempt_autologin(self, page: Page, email: str, password: str) -> None:
+        """Best-effort: fill Handshake's employer / career-services login form.
+
+        Handshake's login screen has evolved; we try a few selectors and fall
+        back silently if the form doesn't match. If a school SSO redirect
+        happens, we leave it to the operator to complete.
+        """
+        email_selectors = (
+            "input[name='user[email]']",
+            "input[type='email']",
+            "input#email-address-identifier",
+            "input[name='email']",
+            "input[autocomplete='username']",
+        )
+        password_selectors = (
+            "input[name='user[password]']",
+            "input[type='password']",
+            "input[autocomplete='current-password']",
+        )
+
+        email_input = None
+        for sel in email_selectors:
+            loc = page.locator(sel).first
+            try:
+                if await loc.is_visible(timeout=2_000):
+                    email_input = loc
+                    break
+            except Exception:
+                continue
+        if email_input is None:
+            raise RuntimeError("Could not find an email input on the login page.")
+
+        await email_input.fill(email)
+
+        for sel in (
+            "button[type='submit']",
+            "button:has-text('Next')",
+            "button:has-text('Continue')",
+        ):
+            btn = page.locator(sel).first
+            try:
+                if await btn.is_visible(timeout=1_000):
+                    await btn.click()
+                    break
+            except Exception:
+                continue
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10_000)
+        except PWTimeoutError:
+            pass
+
+        if self._on_jobs_page(page):
+            return
+
+        password_input = None
+        for sel in password_selectors:
+            loc = page.locator(sel).first
+            try:
+                if await loc.is_visible(timeout=4_000):
+                    password_input = loc
+                    break
+            except Exception:
+                continue
+        if password_input is None:
+            console.print(
+                "[yellow]Password field not visible – this account probably uses"
+                " institutional SSO. Finish login in the Chromium window.[/yellow]"
+            )
+            return
+
+        await password_input.fill(password)
+        for sel in (
+            "button[type='submit']",
+            "button:has-text('Sign in')",
+            "button:has-text('Log in')",
+        ):
+            btn = page.locator(sel).first
+            try:
+                if await btn.is_visible(timeout=1_000):
+                    await btn.click()
+                    break
+            except Exception:
+                continue
+
+        try:
+            await page.wait_for_url(
+                re.compile(r"app\.joinhandshake\.com/postings"), timeout=20_000
+            )
+        except PWTimeoutError:
+            pass
 
     async def _process_jobs(self, page: Page) -> None:
         while True:

@@ -59,6 +59,12 @@ def _parse_args() -> AgentConfig:
         default=50,
         help="Slow down Playwright actions by this many ms (helps Handshake keep up).",
     )
+    p.add_argument(
+        "--login-timeout",
+        type=int,
+        default=600,
+        help="How long (seconds) to wait for manual login/2FA before giving up.",
+    )
     args = p.parse_args()
 
     return AgentConfig(
@@ -69,6 +75,7 @@ def _parse_args() -> AgentConfig:
         max_jobs=args.max_jobs,
         min_confidence_to_auto=args.min_confidence,
         slow_mo_ms=args.slow_mo,
+        login_timeout_s=args.login_timeout,
     )
 
 

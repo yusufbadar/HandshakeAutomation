@@ -38,9 +38,27 @@ python3 -m playwright install chromium
 
 ## 2. Log in (first run only)
 
-The agent uses a persistent Chromium profile so you only log in once. Kick
-off a dry run – a Chromium window will open, navigate to Handshake, and wait
-for you to sign in (NYU SSO, 2FA, etc.).
+The agent uses a persistent Chromium profile so you only log in once. There
+are two ways to hand it the login:
+
+**Option A – Automatic (non-SSO accounts):** copy `.env.example` to `.env`
+and fill in:
+
+```bash
+cp .env.example .env
+# then edit .env and set HANDSHAKE_EMAIL / HANDSHAKE_PASSWORD
+```
+
+`.env` is gitignored – the file never leaves your machine. On launch the
+agent will auto-fill those fields on Handshake's login page. If your
+account uses institutional SSO, the agent will stop at the SSO screen and
+wait for you to finish manually; that's fine.
+
+**Option B – Fully manual:** just run the agent and log in yourself in the
+Chromium window that opens.
+
+Either way, kick off a dry run – a Chromium window will open, navigate to
+Handshake, and wait for you to sign in (NYU SSO, 2FA, etc.) if needed.
 
 ```bash
 python3 -m handshake_agent --dry-run --max-jobs 5
