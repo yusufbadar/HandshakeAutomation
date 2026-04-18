@@ -9,10 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-HEALTH = "NYUAD Health, Science, and Engineering"
-MEDIA = "NYUAD Media, Arts, and Communications"
-SOCIAL = "NYUAD Social Impact and Global Affairs"
-TECH = "NYUAD Technology, Business, and Innovation"
+HEALTH = "nyuad health, science, and engineering"
+MEDIA = "nyuad media, arts, and communications"
+SOCIAL = "nyuad social impact and global affairs"
+TECH = "nyuad technology, business, and innovation"
 
 
 ALL_LABELS: tuple[str, ...] = (HEALTH, MEDIA, SOCIAL, TECH)
@@ -293,6 +293,10 @@ PATHWAYS: tuple[Pathway, ...] = (
             "creative",
             "storytelling",
             "storyteller",
+            "short-form",
+            "short form",
+            "long-form",
+            "long form",
             "journalism",
             "journalist",
             "editor",

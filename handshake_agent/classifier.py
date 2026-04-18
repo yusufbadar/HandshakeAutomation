@@ -29,10 +29,10 @@ DESCRIPTION_WEIGHT = 1
 
 
 PRIORITY_ORDER = {
-    "NYUAD Technology, Business, and Innovation": 0,
-    "NYUAD Health, Science, and Engineering": 1,
-    "NYUAD Social Impact and Global Affairs": 2,
-    "NYUAD Media, Arts, and Communications": 3,
+    "nyuad technology, business, and innovation": 0,
+    "nyuad health, science, and engineering": 1,
+    "nyuad social impact and global affairs": 2,
+    "nyuad media, arts, and communications": 3,
 }
 
 

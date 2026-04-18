@@ -67,6 +67,12 @@ CASES = [
         "Computer Science, Data Science",
         TECH,
     ),
+    (
+        "Short-Form Storyteller",
+        "Looking for a creative storyteller to produce short-form video content for social media.",
+        "",
+        MEDIA,
+    ),
 ]
 
 
