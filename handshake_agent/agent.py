@@ -416,8 +416,17 @@ class HandshakeLabelAgent:
 
         try:
             await self._apply_label(page, result.label)
-            console.print(f"[bold green]✓ Applied:[/bold green] {result.label}")
-            self.stats.labeled += 1
+            # Detect Handshake's "This label has already been applied"
+            # toast, which means the job silently had the label before we
+            # got here – treat as a skip, not a success.
+            if await self._saw_already_applied_toast(page):
+                console.print(
+                    "[yellow]Handshake reports this label was already applied – treating as skip.[/yellow]"
+                )
+                self.stats.skipped_already_labeled += 1
+            else:
+                console.print(f"[bold green]✓ Applied:[/bold green] {result.label}")
+                self.stats.labeled += 1
         except Exception as exc:
             console.print(f"[red]Failed to apply label: {exc}[/red]")
             self.stats.errors += 1
@@ -482,125 +491,212 @@ class HandshakeLabelAgent:
             return re.sub(r"\s+", " ", m.group(2)).strip()
         return ""
 
-    def _label_panel_selector(self) -> str:
-        # The Label panel contains a "NORMAL LABELS" header + a Select2
-        # dropdown whose placeholder is "Select a label...". We anchor on
-        # either of those so we can scope other lookups to just that panel.
-        return (
-            "div:has(> *:has-text('NORMAL LABELS')), "
-            "section:has(*:has-text('NORMAL LABELS')), "
-            "div:has(.select2-choice:has-text('Select a label'))"
-        )
+    async def _saw_already_applied_toast(self, page: Page) -> bool:
+        """Handshake flashes a red 'This label has already been applied'
+        toast when you try to re-add an existing label. Poll for ~2s."""
+        for _ in range(8):
+            try:
+                if (
+                    await page.get_by_text("already been applied", exact=False).count()
+                    > 0
+                ):
+                    return True
+            except Exception:
+                pass
+            await page.wait_for_timeout(250)
+        return False
+
+    async def _scroll_label_panel_into_view(self, page: Page) -> None:
+        """Scroll the 'NORMAL LABELS' panel into view so clicks work."""
+        try:
+            header = page.get_by_text("NORMAL LABELS", exact=False).first
+            if await header.count() > 0:
+                await header.scroll_into_view_if_needed(timeout=2_000)
+        except Exception:
+            pass
 
     async def _read_existing_labels(self, page: Page) -> list[str]:
-        """Read the blue 'pill' chips from the NORMAL LABELS section."""
-        labels: list[str] = []
+        """Read the blue pill chips from the 'NORMAL LABELS' section.
 
-        # The pills live inside a Select2 multi-select, so the visible chip
-        # text is typically `<li class="select2-search-choice">LABEL<a>×</a></li>`.
-        pill_selectors = (
-            "ul.select2-choices li.select2-search-choice",
-            "li.select2-search-choice",
-            "div:has(> *:has-text('NORMAL LABELS')) li.select2-search-choice",
-        )
-        for sel in pill_selectors:
-            try:
-                items = await page.locator(sel).all_inner_texts()
-            except Exception:
-                items = []
-            for t in items:
-                # Pill text often ends with an '×' remove control.
-                t = re.sub(r"[\u00d7xX×]\s*$", "", t or "").strip()
-                if t and t not in labels:
-                    labels.append(t)
-            if labels:
-                break
-
-        # Handshake may also show labels as simple badge spans elsewhere.
-        if not labels:
-            fallback_selectors = (
-                "div:has(> *:has-text('NORMAL LABELS')) span[style*='background']",
-                "div:has(> *:has-text('NORMAL LABELS')) span.badge",
-            )
-            for sel in fallback_selectors:
-                try:
-                    items = await page.locator(sel).all_inner_texts()
-                except Exception:
-                    items = []
-                for t in items:
-                    t = (t or "").strip()
-                    if t and t not in labels:
-                        labels.append(t)
-                if labels:
-                    break
-
-        return [lbl.lower() for lbl in labels if lbl]
-
-    async def _apply_label(self, page: Page, label: str) -> None:
-        """Apply one label via the 'Select a label...' dropdown.
-
-        Handshake uses a Select2 combobox. Clicking it reveals a search
-        input (often attached to document.body), into which we type the
-        label's lowercase name. The matching option in the list gets
-        clicked. Handshake auto-saves – no button needs pressing.
+        The pill is a small element with the label text followed by an
+        'x' close button. We scan candidate elements in the label panel
+        and match anything that looks like a short labelled chip.
         """
-        await page.wait_for_timeout(400)
+        await self._scroll_label_panel_into_view(page)
 
-        combobox = page.locator(
-            "a.select2-choice:has-text('Select a label'), "
-            ".select2-container:has-text('Select a label')"
-        ).first
-        if not await combobox.is_visible():
-            combobox = page.get_by_text("Select a label...", exact=False).first
-            if not await combobox.is_visible():
-                raise RuntimeError("Could not find the 'Select a label...' dropdown.")
-        await combobox.click()
-        await page.wait_for_timeout(300)
+        labels: list[str] = []
+        known_lower = {lbl.lower() for lbl in ALL_LABELS}
 
-        search = page.locator(
-            ".select2-drop-active input.select2-input, "
-            "input.select2-input:visible, "
-            ".select2-search input:visible"
-        ).first
-        await search.wait_for(state="visible", timeout=5_000)
-        await search.fill("")
-        await search.type(label, delay=10)
-        await page.wait_for_timeout(700)
-
-        option_selectors = (
-            f".select2-drop-active .select2-results li:has-text(\"{label}\")",
-            f".select2-results li:has-text(\"{label}\")",
-            f"li.select2-result-selectable:has-text(\"{label}\")",
-        )
-        option = None
-        for sel in option_selectors:
-            loc = page.locator(sel).first
+        # Try: find every visible element whose inner text matches a known
+        # pathway label verbatim. This is the most reliable signal.
+        for lbl in ALL_LABELS:
             try:
-                if await loc.is_visible(timeout=2_000):
-                    option = loc
-                    break
+                loc = page.get_by_text(lbl, exact=True)
+                if await loc.count() > 0 and await loc.first.is_visible(timeout=500):
+                    labels.append(lbl)
             except Exception:
                 continue
 
-        if option is None:
-            # Fallback: some skins render options with matched substrings
-            # wrapped in <span class="select2-match">…</span>, so the
-            # simple :has-text check above can fail for hyphenated labels.
-            # Try pressing Enter to pick the first result.
-            await page.keyboard.press("Enter")
-        else:
-            await option.click()
+        if labels:
+            return [l.lower() for l in labels]
 
-        await page.wait_for_timeout(1_200)
-
-        # Close the dropdown if it is still open; Handshake auto-saves.
+        # Fallback: scrape any short text blob inside elements near the
+        # NORMAL LABELS header.
         try:
-            if await page.locator(".select2-drop-active").is_visible():
+            candidates = await page.locator(
+                "xpath=//*[contains(translate(text(),'NORMAL LABELS','normal labels'),"
+                "'normal labels')]/following::*[position()<30]"
+            ).all_inner_texts()
+        except Exception:
+            candidates = []
+
+        for t in candidates:
+            t = (t or "").strip()
+            t = re.sub(r"[\u00d7xX×]\s*$", "", t).strip()
+            if not t or len(t) > 120:
+                continue
+            if t.lower() in known_lower and t not in labels:
+                labels.append(t)
+
+        return [l.lower() for l in labels]
+
+    async def _apply_label(self, page: Page, label: str) -> None:
+        """Open the 'Select a label…' chooser, type the label, click the option.
+
+        Handshake's chooser is a custom React combobox that:
+          - displays the text 'Select a label…' when closed,
+          - on click, renders a visible <input placeholder="Type to search…">,
+          - shows a dropdown list where each option row has the label name
+            (bold) and a 'Normal Label' subtitle.
+
+        Handshake auto-saves; no Save button is needed. We just click the
+        option and close the dropdown.
+        """
+        await self._scroll_label_panel_into_view(page)
+        await page.wait_for_timeout(300)
+
+        if not await self._open_label_chooser(page):
+            raise RuntimeError("Could not find the 'Select a label...' dropdown.")
+
+        search = await self._find_label_search_input(page)
+        if search is None:
+            raise RuntimeError("Label chooser opened but 'Type to search...' input not found.")
+
+        await search.fill("")
+        await search.type(label, delay=15)
+        await page.wait_for_timeout(800)
+
+        option = await self._find_label_option(page, label)
+        if option is None:
+            try:
+                await search.press("Enter")
+            except Exception:
+                pass
+            await page.wait_for_timeout(600)
+            option = await self._find_label_option(page, label)
+
+        if option is None:
+            # Bail out cleanly: close the chooser so next job isn't affected.
+            try:
                 await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Dropdown did not offer an option matching {label!r}."
+            )
+
+        await option.click()
+        await page.wait_for_timeout(1_000)
+
+        try:
+            await page.keyboard.press("Escape")
         except Exception:
             pass
 
         await self._wait_for_label_to_appear(page, label)
+
+    async def _open_label_chooser(self, page: Page) -> bool:
+        """Click the element that shows 'Select a label…' and returns True
+        if a search input appears within a few seconds."""
+        clicked = False
+        selectors = (
+            # Text-based – most reliable since the placeholder is stable.
+            "text=/^\\s*Select a label/i",
+            "div:has-text('Select a label')",
+            "[placeholder*='Select a label' i]",
+            "[aria-label*='Select a label' i]",
+            "button:has-text('Select a label')",
+            # Structural fallbacks inside the Label panel.
+            "xpath=//*[contains(text(),'NORMAL LABELS')]/following::*"
+            "[self::div or self::button or self::span][1]",
+        )
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if not await loc.count():
+                    continue
+                await loc.scroll_into_view_if_needed(timeout=1_500)
+                await loc.click(timeout=2_500)
+                clicked = True
+                break
+            except Exception:
+                continue
+
+        if not clicked:
+            return False
+
+        # Wait briefly for the search input to appear.
+        for _ in range(10):
+            inp = await self._find_label_search_input(page)
+            if inp is not None:
+                return True
+            await page.wait_for_timeout(250)
+        return False
+
+    async def _find_label_search_input(self, page: Page):
+        """Return a locator for the visible 'Type to search…' input,
+        or None."""
+        selectors = (
+            "input[placeholder='Type to search...']:visible",
+            "input[placeholder*='Type to search' i]:visible",
+            "input[placeholder*='Select a label' i]:visible",
+            "input[role='combobox']:visible",
+            "input[aria-autocomplete='list']:visible",
+        )
+        for sel in selectors:
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() and await loc.is_visible(timeout=500):
+                    return loc
+            except Exception:
+                continue
+        return None
+
+    async def _find_label_option(self, page: Page, label: str):
+        """Find the dropdown option whose primary text equals `label`.
+
+        Each option row in the screenshots has the label text on the
+        first line and 'Normal Label' on the second line, so we prefer
+        an element containing BOTH.
+        """
+        esc = label.replace('"', '\\"')
+        selectors = (
+            f"li:has-text(\"{esc}\"):has-text(\"Normal Label\")",
+            f"[role='option']:has-text(\"{esc}\"):has-text(\"Normal Label\")",
+            f"div:has-text(\"{esc}\"):has-text(\"Normal Label\")",
+            f"li:has-text(\"{esc}\")",
+            f"[role='option']:has-text(\"{esc}\")",
+            f"li[role='option']:has-text(\"{esc}\")",
+            f"div[role='option']:has-text(\"{esc}\")",
+        )
+        for sel in selectors:
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() and await loc.is_visible(timeout=500):
+                    return loc
+            except Exception:
+                continue
+        return None
 
     async def _wait_for_label_to_appear(self, page: Page, label: str) -> None:
         """The PDF warns that labels take a moment to show up and the page
