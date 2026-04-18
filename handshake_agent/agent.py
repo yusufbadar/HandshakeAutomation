@@ -563,36 +563,58 @@ class HandshakeLabelAgent:
 
         return [l.lower() for l in labels]
 
+    def _label_panel(self, page: Page):
+        """Locate the Label panel on the job detail page.
+
+        The panel is uniquely identified by containing the 'Create New
+        Label' button, so we anchor everything else inside it.
+        """
+        return page.locator(
+            "xpath=//button[normalize-space()='Create New Label']"
+            "/ancestor::*[self::div or self::section][1]"
+        ).first
+
     async def _apply_label(self, page: Page, label: str) -> None:
         """Open the 'Select a label…' chooser, type the label, click the option.
 
-        Handshake's chooser is a custom React combobox that:
-          - displays the text 'Select a label…' when closed,
-          - on click, renders a visible <input placeholder='Type to search…'>,
-          - shows a dropdown list where each option row has the label name
-            on line 1 and 'Normal Label' on line 2.
+        Handshake's chooser is a custom React combobox in the Label panel
+        (bottom-left of the job page, above the 'Create New Label' button):
+          - closed state shows 'Select a label…',
+          - on click, a visible <input placeholder='Type to search…'>
+            appears,
+          - option rows show the label name on line 1 and 'Normal Label'
+            on line 2.
 
         Handshake auto-saves; no Save button is needed.
         """
-        await self._scroll_label_panel_into_view(page)
+        panel = self._label_panel(page)
+        try:
+            await panel.wait_for(state="visible", timeout=5_000)
+        except PWTimeoutError as exc:
+            raise RuntimeError(
+                "Could not locate the Label panel on the job page."
+            ) from exc
+        try:
+            await panel.scroll_into_view_if_needed(timeout=1_500)
+        except Exception:
+            pass
 
-        if not await self._click_select_a_label(page):
+        if not await self._click_select_a_label(page, panel):
             raise RuntimeError("Could not find the 'Select a label...' dropdown.")
 
-        search_handle = await page.wait_for_selector(
-            "input[placeholder='Type to search...'], "
-            "input[placeholder*='Type to search' i], "
-            "input[role='combobox'], "
-            "input[aria-autocomplete='list']",
-            state="visible",
-            timeout=4_000,
-        )
-        if search_handle is None:
-            raise RuntimeError("Label chooser opened but 'Type to search...' input not found.")
+        # Scope the search input STRICTLY to the label panel so we never
+        # accidentally grab the global 'Search all of Handshake…' bar.
+        search = panel.locator("input:visible").first
+        try:
+            await search.wait_for(state="visible", timeout=4_000)
+        except PWTimeoutError as exc:
+            raise RuntimeError(
+                "Label chooser opened but no search input appeared in the Label panel."
+            ) from exc
 
         try:
-            await search_handle.fill("")
-            await search_handle.fill(label)
+            await search.fill("")
+            await search.fill(label)
         except Exception as exc:
             raise RuntimeError(f"Could not type into label search: {exc}") from exc
 
@@ -600,7 +622,7 @@ class HandshakeLabelAgent:
 
         if option_handle is None:
             try:
-                await search_handle.press("Enter")
+                await search.press("Enter")
             except Exception:
                 pass
             await page.wait_for_timeout(300)
@@ -616,9 +638,8 @@ class HandshakeLabelAgent:
         try:
             await option_handle.click()
         except Exception:
-            # Handle went stale – try Enter on the search input as fallback.
             try:
-                await search_handle.press("Enter")
+                await search.press("Enter")
             except Exception:
                 pass
 
@@ -629,36 +650,39 @@ class HandshakeLabelAgent:
 
         await self._wait_for_label_to_appear(page, label)
 
-    async def _click_select_a_label(self, page: Page) -> bool:
-        """Click the 'Select a label...' chooser. Returns True on success."""
-        selectors = (
-            "text=/^\\s*Select a label/i",
-            "[placeholder*='Select a label' i]",
-            "[aria-label*='Select a label' i]",
-            "div:has-text('Select a label')",
-            "xpath=//*[contains(text(),'NORMAL LABELS')]/following::*"
-            "[self::div or self::button or self::span][1]",
+    async def _click_select_a_label(self, page: Page, panel) -> bool:
+        """Click the 'Select a label...' chooser inside the Label panel."""
+        candidates = (
+            panel.locator("xpath=.//*[normalize-space()='Select a label...']").first,
+            panel.locator("xpath=.//*[contains(normalize-space(),'Select a label')]").first,
+            panel.get_by_text("Select a label", exact=False).first,
         )
-        for sel in selectors:
+        for cand in candidates:
             try:
-                handle = await page.wait_for_selector(sel, state="visible", timeout=1_500)
-            except Exception:
-                handle = None
-            if handle is None:
-                continue
-            try:
-                await handle.scroll_into_view_if_needed(timeout=1_000)
+                if not await cand.count():
+                    continue
+                await cand.scroll_into_view_if_needed(timeout=1_000)
             except Exception:
                 pass
             try:
-                await handle.click(timeout=1_500)
-                return True
+                await cand.click(timeout=1_500)
             except Exception:
                 try:
-                    await handle.evaluate("el => el.click()")
-                    return True
+                    handle = await cand.element_handle()
+                    if handle is not None:
+                        await handle.evaluate("el => el.click()")
+                    else:
+                        continue
                 except Exception:
                     continue
+            # Wait briefly for a visible input to appear in the panel.
+            try:
+                await panel.locator("input:visible").first.wait_for(
+                    state="visible", timeout=1_500
+                )
+                return True
+            except PWTimeoutError:
+                continue
         return False
 
     async def _wait_for_label_option(self, page: Page, label: str, timeout_ms: int):
